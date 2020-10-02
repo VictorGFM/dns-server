@@ -25,13 +25,20 @@ using namespace std;
 
 void logExit(const char *message);
 void createThread(char *port);
-
 void *connection_handler(void *port);
 int initializeServerAddress(const char *ipVersion, const char *portstr,
                             struct sockaddr_storage *storage);
+void createSocket(struct sockaddr_storage *serverAddressStorage);
+void bindServer(struct sockaddr_storage *serverAddressStorage);
+void receiveMessage(char *buffer, struct sockaddr_storage *clientAddressStorage);
+void sendIpFromHostnameFound(char *buffer, struct sockaddr_storage *clientAddressStorage, string hostname);
+void sendHostNotFound(char *buffer, struct sockaddr_storage *clientAddressStorage);
+string searchHostOnLinkedServers(string hostname);
+void addHost(string hostname, string ip);
+void searchHost(string hostname);
 int addressParse(const char *addrstr, const char *portstr,
                  struct sockaddr_storage *storage);
-//void addrtostr(const struct sockaddr *addr, char *str, size_t strsize);
+void connectLink(string ip, string port);
 
 int serverSocket;
 map<string, string> hosts;
@@ -43,58 +50,22 @@ int main(int argc, char *argv[]) {
 
     while(true) {
         string commandType;
-        
+    
         cout << "Enter a command: ";
         cin >> commandType;
 
         if(commandType == ADD_TYPE) {
             string hostname, ip;
             cin >> hostname >> ip;
-            bool hostFound = hosts.find(hostname) != hosts.end();
-            if(hostFound) {
-                hosts[hostname] = ip;
-                cout << "Hostname: "<< hostname <<" with Ip: "<< ip <<" updated with success!" << endl;
-            } else {
-                hosts.insert(pair<string, string>(hostname, ip));
-                cout << "Hostname: "<< hostname <<" with Ip: "<< ip <<" added with success!" << endl;
-            } 
+            addHost(hostname, ip);
         } else if(commandType == SEARCH_TYPE) {
             string hostname;
             cin >> hostname;
-            bool hostFound = hosts.find(hostname) != hosts.end();
-            if(hostFound) {
-                cout << "Hostname found! With the following Ip: "<< hosts[hostname] << endl;
-            } else if(!links.empty()){
-                for(auto it=links.begin(); it!=links.end(); it++) {
-                    string ip = it->first;
-                    string port = it->second;
-                    char buffer[BUFFER_SIZE];
-
-                    memset(buffer, 0, BUFFER_SIZE);
-                    buffer[0] = REQUEST_TYPE;
-                    strcpy(&buffer[1], hostname.c_str()); 
-
-                    struct sockaddr_storage clientAddressStorage;
-                    if(addressParse(ip.c_str(), port.c_str(), &clientAddressStorage) != 0) {
-                        logExit("Error parsing address.");
-                    }
-
-                    struct sockaddr *clientAddress = (struct sockaddr *)(&clientAddressStorage);
-
-                    int sizeMessage = sendto(serverSocket, (const char*)buffer, BUFFER_SIZE, MSG_CONFIRM, 
-                                             clientAddress, sizeof(clientAddressStorage));
-                    if(sizeMessage < 0) {
-                        logExit("Error sending message. (Invalid format)");
-                    }
-                }
-            } else {
-                cout << "Hostname not found!" << endl;
-            }
+            searchHost(hostname);
         } else if(commandType == LINK_TYPE) {
             string ip, port;
             cin >> ip >> port;
-            links.insert(pair<string, string>(ip, port));
-            cout << "Link with Ip: "<< ip <<" and Port: "<< port <<" connected with success!" << endl;
+            connectLink(ip, port);
         }
     }
 
@@ -123,63 +94,29 @@ void *connection_handler(void *port) {
         logExit("Error initializing server address.");
     }
 
-    serverSocket = socket(serverAddressStorage.ss_family, SOCK_DGRAM, 0);
-    if (serverSocket == -1) {
-        logExit("Error on creating socket!");
-    }
-    cout << "Server socket created!" << endl;
+    createSocket(&serverAddressStorage);
 
-    int enable = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) != 0) {
-        logExit("Error setting socket options.");
-    }
+    bindServer(&serverAddressStorage);
     
-    struct sockaddr *serverAddress = (struct sockaddr *)(&serverAddressStorage);
-    if (bind(serverSocket, serverAddress, sizeof(serverAddressStorage)) != 0) {
-        logExit("Error on binding server!");
-    }
-    cout << "Server binded!" << endl;
-
     listen(serverSocket, 3);
 
     while (true) {
         cout << "Waiting for messages..." << endl;
         char buffer[BUFFER_SIZE];
-        memset(buffer, 0, BUFFER_SIZE);
-
-        struct sockaddr *clientAddress = (struct sockaddr *)(&clientAddressStorage);
-
-        socklen_t len = sizeof(clientAddressStorage);
-        int sizeMessage = recvfrom(serverSocket, (char*)buffer, BUFFER_SIZE, MSG_WAITALL, 
-                                   clientAddress, &len); 
-        if(sizeMessage == 0) {
-            logExit("Error receiving message. (Invalid format)");
-        }
+        
+        receiveMessage(buffer, &clientAddressStorage);
         
         int messageType = (int) buffer[0];
         if(messageType == REQUEST_TYPE) {
             string hostname(&buffer[1]);
             bool hostFound = hosts.find(hostname) != hosts.end();
             if(hostFound) {
-                memset(buffer, 0, BUFFER_SIZE);
-                buffer[0] = RESPONSE_TYPE;
-                strcpy(&buffer[1], hosts[hostname].c_str()); 
-                int sizeMessage = sendto(serverSocket, (char*)buffer, BUFFER_SIZE, MSG_CONFIRM, 
-                       clientAddress, sizeof(clientAddressStorage));
-                if(sizeMessage < 0) {
-                    logExit("Error sending message. (Invalid format)");
-                }
+                sendIpFromHostnameFound(buffer, &clientAddressStorage, hostname);
             } else if(!links.empty()) {
-                //send request to linked servers 
+                string result = searchHostOnLinkedServers(hostname);
+                //send response with result (NOT_FOUND or IP FOUND)
             } else {
-                memset(buffer, 0, BUFFER_SIZE);
-                buffer[0] = RESPONSE_TYPE;
-                buffer[1] = -1;
-                int sizeMessage = sendto(serverSocket, (char*)buffer, BUFFER_SIZE, MSG_CONFIRM, 
-                       clientAddress, sizeof(clientAddressStorage)); 
-                if(sizeMessage < 0) {
-                    logExit("Error sending message. (Invalid format)");
-                }
+                sendHostNotFound(buffer, &clientAddressStorage);
             }
         } else if(messageType == RESPONSE_TYPE) {
             if(buffer[1] == HOSTNAME_NOT_FOUND) {
@@ -220,6 +157,122 @@ int initializeServerAddress(const char *ipVersion, const char *portstr,
     }
 }
 
+void createSocket(struct sockaddr_storage *serverAddressStorage) {
+    serverSocket = socket(serverAddressStorage->ss_family, SOCK_DGRAM, 0);
+    if (serverSocket == -1) {
+        logExit("Error on creating socket!");
+    }
+    cout << "Server socket created!" << endl;
+
+    int enable = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) != 0) {
+        logExit("Error setting socket options.");
+    }
+}
+
+void bindServer(struct sockaddr_storage *serverAddressStorage) {
+    struct sockaddr *serverAddress = (struct sockaddr *)(serverAddressStorage);
+    if (bind(serverSocket, serverAddress, sizeof(*serverAddressStorage)) != 0) {
+        logExit("Error on binding server!");
+    }
+    cout << "Server binded!" << endl;
+}
+
+void receiveMessage(char *buffer, struct sockaddr_storage *clientAddressStorage) {
+    memset(buffer, 0, BUFFER_SIZE);
+    struct sockaddr *clientAddress = (struct sockaddr *)(clientAddressStorage);
+    socklen_t len = sizeof(*clientAddressStorage);
+    int sizeMessage = recvfrom(serverSocket, (char*)buffer, BUFFER_SIZE, MSG_WAITALL, 
+                               clientAddress, &len); 
+    if(sizeMessage == 0) {
+        logExit("Error receiving message. (Invalid format)");
+    }
+}
+
+void sendIpFromHostnameFound(char *buffer, struct sockaddr_storage *clientAddressStorage, 
+                             string hostname) {
+    memset(buffer, 0, BUFFER_SIZE);
+    buffer[0] = RESPONSE_TYPE;
+    strcpy(&buffer[1], hosts[hostname].c_str()); 
+    struct sockaddr *clientAddress = (struct sockaddr *)(clientAddressStorage);
+    int sizeMessage = sendto(serverSocket, (char*)buffer, BUFFER_SIZE, MSG_CONFIRM, 
+        clientAddress, sizeof(*clientAddressStorage));
+    if(sizeMessage < 0) {
+        logExit("Error sending message. (Invalid format)");  
+    }
+}
+
+void sendHostNotFound(char *buffer, struct sockaddr_storage *clientAddressStorage) {
+    memset(buffer, 0, BUFFER_SIZE);
+    buffer[0] = RESPONSE_TYPE;
+    buffer[1] = HOSTNAME_NOT_FOUND;
+    struct sockaddr *clientAddress = (struct sockaddr *)(clientAddressStorage);
+    int sizeMessage = sendto(serverSocket, (char*)buffer, BUFFER_SIZE, MSG_CONFIRM, 
+        clientAddress, sizeof(*clientAddressStorage)); 
+    if(sizeMessage < 0) {
+        logExit("Error sending message. (Invalid format)");
+    }
+}
+
+void addHost(string hostname, string ip) {
+    bool hostFound = hosts.find(hostname) != hosts.end();
+    if(hostFound) {
+        hosts[hostname] = ip;
+        cout << "Hostname: "<< hostname <<" with Ip: "<< ip <<" updated with success!" << endl;
+    } else {
+        hosts.insert(pair<string, string>(hostname, ip));
+        cout << "Hostname: "<< hostname <<" with Ip: "<< ip <<" added with success!" << endl;
+    } 
+}
+
+void searchHost(string hostname) {
+    bool hostFound = hosts.find(hostname) != hosts.end();
+    if(hostFound) {
+        cout << "Hostname found! With the following Ip: "<< hosts[hostname] << endl;
+    } else if(!links.empty()){
+        string result = searchHostOnLinkedServers(hostname);
+        if(result == to_string(HOSTNAME_NOT_FOUND)) {
+            cout << "Hostname not found!" << endl;
+        } else {
+            cout << "Hostname found! With the following Ip: "<< result << endl;
+        }
+    } else {
+        cout << "Hostname not found!" << endl;
+    }
+}
+
+string searchHostOnLinkedServers(string hostname) {
+    for(auto it=links.begin(); it!=links.end(); it++) {
+        string ip = it->first;
+        string port = it->second;
+        char buffer[BUFFER_SIZE];
+
+        memset(buffer, 0, BUFFER_SIZE);
+        buffer[0] = REQUEST_TYPE;
+        strcpy(&buffer[1], hostname.c_str()); 
+
+        struct sockaddr_storage clientAddressStorage;
+        if(addressParse(ip.c_str(), port.c_str(), &clientAddressStorage) != 0) {
+            logExit("Error parsing address.");
+        }
+        struct sockaddr *clientAddress = (struct sockaddr *)(&clientAddressStorage);
+
+        int sizeMessage = sendto(serverSocket, (const char*)buffer, BUFFER_SIZE, MSG_CONFIRM, 
+                                    clientAddress, sizeof(clientAddressStorage));
+        if(sizeMessage < 0) {
+            logExit("Error sending message.");
+        }
+
+        receiveMessage(buffer, &clientAddressStorage);
+
+        if(buffer[1] != HOSTNAME_NOT_FOUND) {
+            string ip(&buffer[1]);
+            return ip;
+        }
+    }
+    return to_string(HOSTNAME_NOT_FOUND);
+}
+
 int addressParse(const char *addrstr, const char *portstr,
                  struct sockaddr_storage *storage) {
     if (addrstr == NULL || portstr == NULL) {
@@ -253,33 +306,7 @@ int addressParse(const char *addrstr, const char *portstr,
     return -1;
 }
 
-
-
-/* void addrtostr(const struct sockaddr *addr, char *str, size_t strsize) {
-    int version;
-    char addrstr[INET6_ADDRSTRLEN + 1] = "";
-    uint16_t port;
-
-    if (addr->sa_family == AF_INET) {
-        version = 4;
-        struct sockaddr_in *addr4 = (struct sockaddr_in *)addr;
-        if (!inet_ntop(AF_INET, &(addr4->sin_addr), addrstr,
-                       INET6_ADDRSTRLEN + 1)) {
-            logExit("ntop");
-        }
-        port = ntohs(addr4->sin_port); // network to host short
-    } else if (addr->sa_family == AF_INET6) {
-        version = 6;
-        struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)addr;
-        if (!inet_ntop(AF_INET6, &(addr6->sin6_addr), addrstr,
-                       INET6_ADDRSTRLEN + 1)) {
-            logExit("ntop");
-        }
-        port = ntohs(addr6->sin6_port); // network to host short
-    } else {
-        logExit("unknown protocol family.");
-    }
-    if (str) {
-        snprintf(str, strsize, "IPv%d %s %hu", version, addrstr, port);
-    }
-} */
+void connectLink(string ip, string port) {
+    links.insert(pair<string, string>(ip, port));
+    cout << "Link with Ip: "<< ip <<" and Port: "<< port <<" connected with success!" << endl;
+}
