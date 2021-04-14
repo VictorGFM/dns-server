@@ -1,4 +1,4 @@
 all:
-	g++ -Wall server.cpp -lpthread -o servidor_dns
+	g++ -Wall server.cpp -lpthread -o dns-server
 clean:
-	rm servidor_dns
+	rm dns-server
