@@ -1,6 +1,6 @@
 # dns-server
 
-DNS server simulation in C++ language, developed in the Operating Systems discipline at UFMG.
+DNS server simulation in C++ language, developed in the Computer Networks discipline at UFMG.
 
 ## Setup
 
